@@ -1,0 +1,155 @@
+from __future__ import annotations
+
+import inspect
+
+
+class FakeTelegram:
+    def __init__(self, resource):
+        self.resource = resource
+        self.calls = []
+
+    def search(self, keyword):
+        self.calls.append(keyword)
+        return [self.resource]
+
+    def stop(self):
+        return None
+
+
+class FailingTelegram:
+    def search(self, _keyword):
+        raise RuntimeError("offline")
+
+    def stop(self):
+        return None
+
+
+class FakeTransfer:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def transfer(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.result
+
+
+def _config():
+    return {
+        "enabled": True,
+        "telegram_api_id": "12345",
+        "telegram_api_hash": "hash",
+        "telegram_session": "session",
+        "resource_bot": "resource_bot",
+        "search_template": "{keyword}",
+        "p115_cookie": "UID=1; CID=2; SEID=3",
+        "movie_path": "/影视/电影",
+        "tv_path": "/影视/电视剧",
+    }
+
+
+def test_native_search_returns_opaque_high_priority_resource(plugin_module):
+    plugin = plugin_module.Tg115Channel()
+    plugin.init_plugin(_config())
+    resource = plugin_module.BotResource(
+        title="三体 S01 2160P",
+        url="https://115.com/s/swexample?password=a1b2",
+        access_code="a1b2",
+        quality="4K",
+        size=10 * 1024**3,
+    )
+    gateway = FakeTelegram(resource)
+    plugin._telegram = gateway
+
+    results = plugin.search_torrents(site={}, keyword="三体 S01", mtype="电视剧", page=0)
+
+    assert len(results) == 1
+    assert results[0].site_name == "TG115"
+    assert results[0].site_downloader == "Tg115Channel"
+    assert results[0].pri_order == 100
+    assert results[0].category == "电视剧"
+    assert "115.com" not in results[0].enclosure
+    assert gateway.calls == ["三体 S01"]
+
+    cached = plugin.search_torrents(site={}, keyword="三体 S01", mtype="电视剧", page=0)
+    assert len(cached) == 1
+    assert gateway.calls == ["三体 S01"]
+
+
+def test_download_settles_transfer_as_moviepilot_task(plugin_module):
+    plugin = plugin_module.Tg115Channel()
+    plugin.init_plugin(_config())
+    plugin._telegram = FakeTelegram(
+        plugin_module.BotResource(
+            title="沙丘2 2024 2160P",
+            url="https://115.com/s/swexample?password=a1b2",
+            access_code="a1b2",
+        )
+    )
+    torrent = plugin.search_torrents(site={}, keyword="沙丘2 2024", mtype="电影", page=0)[0]
+    transfer = FakeTransfer(plugin_module.TransferResult(True, "115 转存成功", "/影视/电影"))
+    plugin._p115 = transfer
+
+    result = plugin.download(torrent.enclosure, download_dir="/unused")
+
+    assert result is not None
+    downloader, task_hash, layout, message = result
+    assert downloader == "Tg115Channel"
+    assert len(task_hash) == 40
+    assert layout == "NoSubfolder"
+    assert message == ""
+    assert transfer.calls[0]["destination"] == "/影视/电影"
+
+
+def test_foreign_download_token_is_not_claimed(plugin_module):
+    plugin = plugin_module.Tg115Channel()
+    plugin.init_plugin(_config())
+
+    assert plugin.download("magnet:?xt=urn:btih:foreign", download_dir="/unused") is None
+
+
+def test_search_failure_returns_empty_for_normal_site_fallback(plugin_module):
+    plugin = plugin_module.Tg115Channel()
+    plugin.init_plugin(_config())
+    plugin._telegram = FailingTelegram()
+
+    assert plugin.search_torrents(site={}, keyword="Alien", mtype="电影", page=0) == []
+    assert "offline" in plugin._last_error
+
+
+def test_error_messages_hide_credentials_and_share_links(plugin_module):
+    plugin = plugin_module.Tg115Channel()
+    plugin.init_plugin(_config())
+
+    message = plugin._safe_message("failed https://115.com/s/private?password=a1b2 UID=1; CID=2; SEID=3 hash session")
+
+    assert "115.com" not in message
+    assert "password" not in message
+    assert "UID=1" not in message
+    assert "hash" not in message
+    assert "session" not in message
+
+
+def test_malformed_persisted_resource_is_ignored(plugin_module):
+    plugin = plugin_module.Tg115Channel()
+    plugin._test_data[plugin_module.RESOURCE_DATA_KEY] = {
+        "a" * 64: {"discovered_at": "not-a-number"},
+    }
+
+    plugin.init_plugin(_config())
+
+    assert plugin._resource_records == {}
+
+
+def test_moviepilot_module_contract_signatures(plugin_module):
+    plugin = plugin_module.Tg115Channel()
+    plugin.init_plugin(_config())
+    modules = plugin.get_module()
+
+    assert set(modules) == {"search_torrents", "async_search_torrents", "download"}
+    search_parameters = inspect.signature(modules["search_torrents"]).parameters
+    download_parameters = inspect.signature(modules["download"]).parameters
+    assert {"site", "keyword", "mtype", "page"} <= set(search_parameters)
+    assert {"content", "download_dir", "cookie", "episodes", "category", "label", "downloader"} <= set(
+        download_parameters
+    )

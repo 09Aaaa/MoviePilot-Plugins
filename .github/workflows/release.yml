@@ -1,0 +1,38 @@
+name: Release TG115 plugin
+
+on:
+  push:
+    tags:
+      - "Tg115Channel_v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Validate release version
+        run: python scripts/check_version.py --tag "${GITHUB_REF_NAME}"
+      - name: Compile plugin
+        run: python -m compileall -q plugins.v3/tg115channel
+      - name: Build plugin archive
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#Tg115Channel_v}"
+          archive="tg115channel_v${version}.zip"
+          cd plugins.v3
+          zip -qr "../${archive}" tg115channel \
+            -x '*/__pycache__/*' '*.pyc' '*.pyo' '*.egg-info/*' '*/build/*' '*/.DS_Store'
+          cd ..
+          printf 'PLUGIN_ARCHIVE=%s\n' "${archive}" >> "${GITHUB_ENV}"
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" "${PLUGIN_ARCHIVE}" --generate-notes --verify-tag

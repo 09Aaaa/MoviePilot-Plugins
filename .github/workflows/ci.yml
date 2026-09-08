@@ -1,0 +1,29 @@
+name: TG115 CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install test tools
+        run: python -m pip install "pytest~=9.0" "ruff~=0.16.4" ./plugins.v3/tg115channel
+      - name: Check versions
+        run: python scripts/check_version.py
+      - name: Compile plugin
+        run: python -m compileall -q plugins.v3/tg115channel
+      - name: Lint
+        run: python -m ruff check plugins.v3/tg115channel scripts tests
+      - name: Test
+        run: python -m pytest

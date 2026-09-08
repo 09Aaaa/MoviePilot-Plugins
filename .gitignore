@@ -161,3 +161,10 @@ cython_debug/
 
 .idea/
 .vscode/
+.DS_Store
+.ruff_cache/
+.env.*
+*.session
+*.session-journal
+telegram-session.txt
+115-cookie.txt

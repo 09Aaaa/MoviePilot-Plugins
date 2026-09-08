@@ -633,3 +633,9 @@ class RecommendSourceEventData(ChainEventData):
 ### 12. 如何开发V2版本的插件以及实现插件多版本兼容？
 
 - 请参阅 [V2版本插件开发指南](./docs/V2_Plugin_Development.md)
+
+## 本仓库的 V3 插件
+
+- [TG 115资源通道](./plugins.v3/tg115channel/README.md)：优先通过 Telegram 资源机器人搜索，
+  并将选中的 115 分享转存到分类目录。
+- V3 插件市场索引：[`package.v3.json`](./package.v3.json)
