@@ -3,13 +3,14 @@
     "name": "TG 115资源通道",
     "description": "优先通过 Telegram 资源机器人搜索，并将选中的 115 资源转存到分类目录。",
     "labels": "Telegram,115,资源搜索,订阅,转存",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png",
     "author": "09a",
     "level": 1,
     "release": true,
     "system_version": ">=3.0.0",
     "history": {
+      "v0.1.1": "修复配置表单行间距、浮动标签重叠及响应式布局，减少浏览器凭据误填。",
       "v0.1.0": "首个开发版本：接入 MoviePilot V3 插件资源源、Telegram MTProto 搜索、115 直转与机器人命令转存。"
     }
   }

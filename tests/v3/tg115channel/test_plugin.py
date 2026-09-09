@@ -3,6 +3,26 @@ from __future__ import annotations
 import inspect
 
 
+def test_form_uses_consistent_grid_and_preserves_models(plugin_module):
+    plugin = plugin_module.Tg115Channel()
+    form, defaults = plugin.get_form()
+    row = form[0]["content"][0]
+    assert row["component"] == "VRow"
+    assert row["props"]["style"] == "margin: 0;"
+    models = []
+    for column in row["content"]:
+        assert column["component"] == "VCol"
+        assert "padding: 12px" in column["props"]["style"]
+        for control in column["content"]:
+            options = control.get("props", {})
+            if "model" in options:
+                models.append(options["model"])
+            if options.get("type") == "password":
+                assert options["autocomplete"] == "new-password"
+    assert len(models) == len(set(models))
+    assert set(models) == set(defaults)
+
+
 class FakeTelegram:
     def __init__(self, resource):
         self.resource = resource

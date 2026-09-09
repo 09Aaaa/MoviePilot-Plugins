@@ -67,7 +67,7 @@ class Tg115Channel(_PluginBase):
     plugin_name = "TG 115资源通道"
     plugin_desc = "优先通过 Telegram 资源机器人搜索，并将选中的 115 资源转存到分类目录。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
-    plugin_version = "0.1.0"
+    plugin_version = "0.1.1"
     plugin_author = "09a"
     author_url = ""
     plugin_config_prefix = "tg115channel_"
@@ -514,6 +514,36 @@ class Tg115Channel(_PluginBase):
         return []
 
     def get_form(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        form, defaults = self._get_form_schema()
+        # Keep every control in the same grid; adjacent bare inputs otherwise
+        # collide with Vuetify rows' negative margins and floating labels.
+        fields = []
+        for item in form[0]["content"]:
+            if item["component"] == "VRow":
+                fields.extend(item["content"])
+            else:
+                fields.append({"component": "VCol", "props": {"cols": 12}, "content": [item]})
+        for column in fields:
+            props = column["props"]
+            props["style"] = "min-width: 0; padding: 12px;"
+            if props.get("md") == 3:
+                props.update({"sm": 6, "md": 6, "lg": 3})
+            for control in column["content"]:
+                if control["component"] not in {"VTextField", "VSelect", "VSwitch"}:
+                    continue
+                options = control["props"]
+                options.update({"density": "comfortable", "hide-details": "auto"})
+                if options.get("hint"):
+                    options["persistent-hint"] = True
+                if control["component"] == "VTextField":
+                    options["autocomplete"] = "new-password" if options.get("type") == "password" else "off"
+                    options["spellcheck"] = False
+                if options.get("model") == "telegram_api_id":
+                    options.update({"inputmode": "numeric", "placeholder": "例如 12345678"})
+        form[0]["content"] = [{"component": "VRow", "props": {"style": "margin: 0;"}, "content": fields}]
+        return form, defaults
+
+    def _get_form_schema(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         return [
             {
                 "component": "VForm",
