@@ -74,3 +74,64 @@ const run = new Function('model', 'event', 'with(model) { return (' + handlerSou
         "EXPRESSION", json.dumps(module.BOT_UNLOCKED)
     )
     subprocess.run([node, "-e", script], check=True, capture_output=True, text=True, timeout=10)
+
+
+def test_full_form_parses_with_moviepilot_visibility_contract(plugin_module):
+    """MP FormRender writes style.display in prop order; CSS strings cannot receive it.
+
+    Contract: MoviePilot-Frontend/src/components/render/FormRender.vue (v3).
+    Exercise the complete schema, not only the login handler or individual expressions.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required to execute the native form parser")
+    form, defaults = plugin_module.Tg115Channel().get_form()
+    script = r"""
+'use strict';
+const assert = require('node:assert/strict');
+const {form, defaults} = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const expression = (value, model) => new Function('model', 'with(model) { return ' + value + ' }')(model);
+function props(raw, model) {
+  const parsed = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (key === 'model') {
+      parsed.modelValue = model[value];
+    } else if (key === 'show' || key === 'v-show') {
+      const visible = expression(value.slice(2, -2).trim(), model);
+      if (!parsed.style) parsed.style = {};
+      parsed.style.display = visible ? '' : 'none';
+    } else if (key.startsWith('on')) {
+      parsed[key] = new Function('model', 'event', 'with(model) { return (' + value + ')(event); }');
+    } else if (typeof value === 'string' && value.startsWith('{{') && value.endsWith('}}')) {
+      parsed[key] = expression(value.slice(2, -2).trim(), model);
+    } else {
+      parsed[key] = typeof value === 'string' && value in model ? model[value] : value;
+    }
+  }
+  return parsed;
+}
+for (const state of ['logged_out', 'code_sent', 'password_needed', 'logged_in', 'unknown']) {
+  const model = {...defaults, _tg_state: state, _tg_logged_in: state === 'logged_in'};
+  const visible = new Set();
+  function visit(item, hidden = false) {
+    const parsed = props(item.props || {}, model);
+    hidden = hidden || parsed.style?.display === 'none';
+    if (item.props?.model && !hidden) visible.add(item.props.model);
+    for (const child of item.content || []) visit(child, hidden);
+  }
+  for (const item of form) visit(item);
+  assert(visible.has('telegram_api_id'));
+  assert(visible.has('telegram_phone'));
+  assert.equal(visible.has('resource_bot'), state === 'logged_in');
+  assert.equal(visible.has('telegram_code'), state === 'code_sent');
+  assert.equal(visible.has('telegram_password'), state === 'password_needed');
+}
+"""
+    result = subprocess.run(
+        [node, "-e", script],
+        input=json.dumps({"form": form, "defaults": defaults}),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr

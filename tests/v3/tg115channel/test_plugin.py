@@ -12,7 +12,7 @@ def test_form_uses_consistent_grid_and_preserves_models(plugin_module):
     models = []
     for column in row["content"]:
         assert column["component"] == "VCol"
-        assert "padding: 12px" in column["props"]["style"]
+        assert column["props"]["style"]["padding"] == "12px"
         for control in column["content"]:
             options = control.get("props", {})
             if "model" in options:

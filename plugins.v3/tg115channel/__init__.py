@@ -69,7 +69,7 @@ class Tg115Channel(_PluginBase):
     plugin_name = "TG 115资源通道"
     plugin_desc = "通过 Telegram 资源机器人搜索，并将选中的 115 资源转存到指定目录。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
-    plugin_version = "0.1.4"
+    plugin_version = "0.1.5"
     _login_lock = threading.RLock()
     plugin_author = "09a"
     author_url = ""
@@ -718,7 +718,7 @@ class Tg115Channel(_PluginBase):
                 fields.append({"component": "VCol", "props": {"cols": 12}, "content": [item]})
         for column in fields:
             props = column["props"]
-            props["style"] = "min-width: 0; padding: 12px;"
+            props["style"] = {"minWidth": "0", "padding": "12px"}
             if props.get("md") == 3:
                 props.update({"sm": 6, "md": 6, "lg": 3})
             for control in column["content"]:
@@ -869,7 +869,11 @@ class Tg115Channel(_PluginBase):
             }
         ]
         for column in form[0]["content"][0]["content"]:
-            column["props"]["style"] = "min-width: 0; padding: 12px;"
+            # FormRender mutates style.display for `show`. Keep an object first:
+            # a later style assignment would overwrite the computed visibility.
+            props = dict(column["props"])
+            props.pop("style", None)
+            column["props"] = {"style": {"minWidth": "0", "padding": "12px"}, **props}
         return form, defaults
 
     def _get_form_schema(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
