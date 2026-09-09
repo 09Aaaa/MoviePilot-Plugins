@@ -15,6 +15,7 @@ from app.plugins import _PluginBase
 from app.sdk.logging import logger
 from app.sdk.media import TorrentInfo
 
+from .login_form import BOT_UNLOCKED, login_buttons, login_handler
 from .models import BotResource
 from .p115_transfer import P115TransferService, TransferResult
 from .protocol import (
@@ -26,7 +27,7 @@ from .protocol import (
     resource_id,
 )
 from .telegram_gateway import TelegramGateway, TelegramGatewayConfig
-from .telegram_login import login_step
+from .telegram_login import check_session, login_step
 
 RESOURCE_DATA_KEY = "resource_registry_v1"
 HISTORY_DATA_KEY = "history_v1"
@@ -68,8 +69,8 @@ class Tg115Channel(_PluginBase):
     plugin_name = "TG 115资源通道"
     plugin_desc = "通过 Telegram 资源机器人搜索，并将选中的 115 资源转存到指定目录。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
-    plugin_version = "0.1.3"
-    _login_lock = threading.Lock()
+    plugin_version = "0.1.4"
+    _login_lock = threading.RLock()
     plugin_author = "09a"
     author_url = ""
     plugin_config_prefix = "tg115channel_"
@@ -81,6 +82,17 @@ class Tg115Channel(_PluginBase):
 
         self.stop_service()
         config = dict(config or {})
+        auth = self.get_data("telegram_auth") or {}
+        if config.get("telegram_session") and not auth:
+            auth = {
+                "session": str(config["telegram_session"]),
+                "state": "unknown",
+                "identity": self._auth_identity(config),
+            }
+            self.save_data("telegram_auth", auth)
+        config["telegram_session"] = (
+            auth.get("session", "") if auth.get("identity") == self._auth_identity(config) else ""
+        )
         self._enabled = _as_bool(config.get("enabled"), False)
         self._config = {
             "enabled": self._enabled,
@@ -88,7 +100,6 @@ class Tg115Channel(_PluginBase):
             "telegram_api_hash": str(config.get("telegram_api_hash") or "").strip(),
             "telegram_session": str(config.get("telegram_session") or "").strip(),
             "telegram_phone": str(config.get("telegram_phone") or "").strip(),
-            "telegram_login_action": "none",
             "telegram_code": "",
             "telegram_password": "",
             "resource_bot": str(config.get("resource_bot") or "").strip().lstrip("@"),
@@ -126,9 +137,98 @@ class Tg115Channel(_PluginBase):
         self._p115 = P115TransferService(self._config["p115_cookie"])
 
         self._process_directory(config)
-        self._process_login(config)
+        self._persist_config()
         if self._enabled:
             self._configure_telegram()
+
+    @staticmethod
+    def _auth_identity(config: dict[str, Any]) -> str:
+        phone = re.sub(r"[\s()-]", "", str(config.get("telegram_phone") or ""))
+        value = f"{config.get('telegram_api_id', '')}:{config.get('telegram_api_hash', '')}:{phone}"
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    def _persist_config(self) -> None:
+        hidden = {"telegram_session", "telegram_login_action", "telegram_code", "telegram_password"}
+        self.update_config({key: value for key, value in self._config.items() if key not in hidden})
+
+    def _login_view(self) -> dict[str, Any]:
+        auth = self.get_data("telegram_auth") or {}
+        config = getattr(self, "_config", {})
+        valid_identity = auth.get("identity") == self._auth_identity(config)
+        logged_in = bool(valid_identity and auth.get("session") and auth.get("state") == "logged_in")
+        pending = self.get_data("telegram_login_pending") or {}
+        state = "logged_in" if logged_in else "logged_out"
+        if pending and time.time() - pending.get("created", 0) < 600:
+            state = "password_needed" if pending.get("password_needed") else "code_sent"
+        elif auth.get("session") and valid_identity and auth.get("state") == "unknown":
+            state = "unknown"
+        message = self.get_data("telegram_login_status") or (
+            "Telegram 已登录，可以配置资源 Bot。" if logged_in else "Telegram 未登录。"
+        )
+        return {"state": state, "logged_in": logged_in, "message": message}
+
+    def telegram_login_api(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Administrator-only button endpoint. Never return the session or password."""
+        action = str(payload.get("action", ""))
+        if action not in {"send", "verify", "cancel", "status"}:
+            return {"state": "error", "logged_in": False, "message": "不支持的登录操作。"}
+        with self._login_lock:
+            if action == "status":
+                if "telegram_api_id" in payload and self._auth_identity(payload) != self._auth_identity(self._config):
+                    return {
+                        "state": "logged_out",
+                        "logged_in": False,
+                        "message": "应用信息或手机号已修改，请重新登录。",
+                    }
+                auth = self.get_data("telegram_auth") or {}
+                if auth.get("identity") != self._auth_identity(self._config):
+                    result = {"state": "logged_out", "message": "Telegram 未登录，请先发送验证码。"}
+                else:
+                    try:
+                        with ThreadPoolExecutor(max_workers=1) as executor:
+                            result = executor.submit(
+                                lambda: asyncio.run(
+                                    check_session(
+                                        api_id=int(self._config["telegram_api_id"]),
+                                        api_hash=self._config["telegram_api_hash"],
+                                        session=auth.get("session", ""),
+                                    )
+                                )
+                            ).result()
+                    except Exception:
+                        result = {"state": "unknown", "message": "暂时无法确认登录状态，请稍后重试。"}
+                if result["state"] == "logged_out" and self._telegram:
+                    self._telegram.stop()
+                    self._telegram = None
+                auth["state"] = result["state"]
+                self.save_data("telegram_auth", auth)
+                # Keep the pending step prompt when checking an unfinished login.
+                if not self.get_data("telegram_login_pending"):
+                    self.save_data("telegram_login_status", result["message"])
+                view = self._login_view()
+                if view["state"] not in {"code_sent", "password_needed"}:
+                    view.update(result)
+                if view["logged_in"] and self._enabled and not self._telegram:
+                    self._configure_telegram()
+                return view
+            previous_identity = self._auth_identity(self._config)
+            for key in ("telegram_api_id", "telegram_api_hash", "telegram_phone"):
+                if key in payload:
+                    self._config[key] = str(payload[key] or "").strip()
+            if self._auth_identity(self._config) != previous_identity and self._telegram:
+                self._telegram.stop()
+                self._telegram = None
+            auth = self.get_data("telegram_auth") or {}
+            self._config["telegram_session"] = (
+                auth.get("session", "") if auth.get("identity") == self._auth_identity(self._config) else ""
+            )
+            self._process_login({**payload, "telegram_login_action": action})
+            view = self._login_view()
+            if view["logged_in"] and self._enabled:
+                if self._telegram:
+                    self._telegram.stop()
+                self._configure_telegram()
+            return view
 
     def _process_directory(self, submitted: dict[str, Any]) -> None:
         cached = self.get_data("directory_browser") or {}
@@ -142,7 +242,7 @@ class Tg115Channel(_PluginBase):
         refresh = _as_bool(submitted.get("refresh_directories"))
         if not refresh and not changed:
             return
-        self.update_config(self._config)
+        self._persist_config()
         self.save_data("directory_status_cookie", cookie_key)
         try:
             listing = self._p115.list_directory(selected, path=self._config["destination_path"])
@@ -160,16 +260,16 @@ class Tg115Channel(_PluginBase):
             self.save_data(
                 "directory_status", f"当前转存目录：{listing['path']}；已读取 {len(listing['children'])} 个子目录。"
             )
-        self.update_config(self._config)
+        self._persist_config()
 
     def _process_login(self, submitted: dict[str, Any]) -> None:
         action = submitted.get("telegram_login_action", "none")
         if action not in {"send", "verify", "cancel"}:
             if submitted.get("telegram_code") or submitted.get("telegram_password"):
-                self.update_config(self._config)
+                self._persist_config()
             return
         # Clear one-shot actions and secrets before doing any network work.
-        self.update_config(self._config)
+        self._persist_config()
         with self._login_lock:
             if action == "cancel":
                 self.save_data("telegram_login_pending", {})
@@ -199,7 +299,11 @@ class Tg115Channel(_PluginBase):
             self.save_data("telegram_login_status", result["message"])
             if result.get("session"):
                 self._config["telegram_session"] = result["session"]
-                self.update_config(self._config)
+                self.save_data(
+                    "telegram_auth",
+                    {"session": result["session"], "state": "logged_in", "identity": self._auth_identity(self._config)},
+                )
+                self._persist_config()
 
     @staticmethod
     def _safe_path(value: Any, fallback: str) -> str:
@@ -217,7 +321,7 @@ class Tg115Channel(_PluginBase):
             self._config["resource_bot"],
         )
         if not all(required):
-            self._last_error = "Telegram 用户会话配置不完整"
+            self._last_error = "请完成 Telegram 账号登录并填写资源 Bot 用户名"
             logger.warning("TG115 已启用，但 Telegram api_id/api_hash/StringSession/机器人用户名配置不完整")
             return
         try:
@@ -588,22 +692,22 @@ class Tg115Channel(_PluginBase):
         }
 
     def get_api(self) -> list[dict[str, Any]]:
-        return []
+        from app.api.dependencies.auth import get_current_active_superuser_async
+        from fastapi import Depends
+
+        return [
+            {
+                "path": "/telegram/login",
+                "endpoint": self.telegram_login_api,
+                "methods": ["POST"],
+                "summary": "Telegram 账号登录和状态检查",
+                "auth": "bear",
+                "dependencies": [Depends(get_current_active_superuser_async)],
+            }
+        ]
 
     def get_form(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         form, defaults = self._get_form_schema()
-        status = self.get_data("telegram_login_status") or "尚未进行手机号登录；已有登录凭证可继续使用。"
-        form[0]["content"].insert(
-            0,
-            {
-                "component": "VAlert",
-                "props": {
-                    "type": "info",
-                    "variant": "tonal",
-                    "text": status,
-                },
-            },
-        )
         # Keep every control in the same grid; adjacent bare inputs otherwise
         # collide with Vuetify rows' negative margins and floating labels.
         fields = []
@@ -658,7 +762,114 @@ class Tg115Channel(_PluginBase):
                         options["hint"] = status + " 选择后保存，再打开可继续选择下一级。"
                 if options.get("model") == "telegram_api_id":
                     options.update({"inputmode": "numeric", "placeholder": "例如 12345678"})
-        form[0]["content"] = [{"component": "VRow", "props": {"style": "margin: 0;"}, "content": fields}]
+        view = self._login_view()
+        current = getattr(self, "_config", {})
+        defaults.update(
+            {
+                "_tg_state": view["state"],
+                "_tg_logged_in": view["logged_in"],
+                "_tg_message": view["message"],
+                "_tg_busy": False,
+                "_tg_api_id": current.get("telegram_api_id", ""),
+                "_tg_api_hash": current.get("telegram_api_hash", ""),
+                "_tg_phone": current.get("telegram_phone", ""),
+            }
+        )
+        account_models = {
+            "telegram_api_id",
+            "telegram_api_hash",
+            "telegram_phone",
+            "telegram_code",
+            "telegram_password",
+        }
+        bot_models = {
+            "resource_bot",
+            "search_template",
+            "request_timeout",
+            "quiet_seconds",
+            "bot_request_count",
+            "bot_request_window",
+            "detail_button_pattern",
+            "search_cache_minutes",
+            "resource_ttl_hours",
+            "telegram_transfer_template",
+            "telegram_success_pattern",
+            "telegram_failure_pattern",
+        }
+        account, bot, other = [], [], []
+        for column in fields:
+            control = column["content"][0]
+            options = control.get("props", {})
+            model = options.get("model")
+            if model in account_models:
+                options["disabled"] = "{{ model._tg_busy }}"
+                column["props"].update({"cols": 12, "md": 6})
+                if model == "telegram_code":
+                    column["props"]["show"] = "{{ model._tg_state === 'code_sent' }}"
+                    options["hint"] = "输入 Telegram 客户端或短信中的验证码，然后点击登录。"
+                elif model == "telegram_password":
+                    column["props"]["show"] = "{{ model._tg_state === 'password_needed' }}"
+                    options["hint"] = "此账号开启了两步验证，请输入密码后点击登录。"
+                elif model == "telegram_phone":
+                    options["hint"] = "包含国家区号，例如 +8613800138000，填写后点击发送登录验证码。"
+                account.append(column)
+            elif model in bot_models:
+                column["props"]["show"] = "{{ " + BOT_UNLOCKED + " }}"
+                bot.append(column)
+            elif control.get("component") != "VAlert":
+                other.append(column)
+
+        def heading(title):
+            return {"component": "VCol", "props": {"cols": 12}, "content": [{"component": "VCardTitle", "text": title}]}
+
+        status = {
+            "component": "VCol",
+            "props": {"cols": 12},
+            "content": [
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "text": "{{ model._tg_message }}",
+                        "variant": "tonal",
+                        "type": "{{ model._tg_logged_in ? 'success' : 'info' }}",
+                        "onVnodeMounted": login_handler(self.__class__.__name__, "status"),
+                    },
+                }
+            ],
+        }
+        locked = {
+            "component": "VCol",
+            "props": {"cols": 12, "show": "{{ !(" + BOT_UNLOCKED + ") }}"},
+            "content": [
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "tonal",
+                        "text": "请先完成上方 Telegram 账号登录，再设置资源 Bot。",
+                    },
+                }
+            ],
+        }
+        form[0]["content"] = [
+            {
+                "component": "VRow",
+                "props": {"style": "margin: 0;"},
+                "content": [
+                    heading("Telegram 账号登录"),
+                    status,
+                    *account,
+                    *login_buttons(self.__class__.__name__),
+                    heading("资源 Bot 设置"),
+                    locked,
+                    *bot,
+                    heading("115 转存设置"),
+                    *other,
+                ],
+            }
+        ]
+        for column in form[0]["content"][0]["content"]:
+            column["props"]["style"] = "min-width: 0; padding: 12px;"
         return form, defaults
 
     def _get_form_schema(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -818,33 +1029,6 @@ class Tg115Channel(_PluginBase):
                             "model": "telegram_password",
                             "label": "两步验证密码（按提示填写）",
                             "hint": "仅在账号开启两步验证时需要；每次保存后清空。",
-                            "persistent-hint": True,
-                            "type": "password",
-                        },
-                    },
-                    {
-                        "component": "VSelect",
-                        "props": {
-                            "model": "telegram_login_action",
-                            "label": "Telegram 登录操作（选择后保存）",
-                            "items": [
-                                {"title": "不执行登录操作", "value": "none"},
-                                {"title": "发送验证码", "value": "send"},
-                                {"title": "完成登录", "value": "verify"},
-                                {"title": "取消本次登录 / 准备重发", "value": "cancel"},
-                            ],
-                            "hint": (
-                                "保存后重新打开配置查看结果。新设备验证按 Telegram 提示完成；登录成功后自动保存凭证。"
-                            ),
-                            "persistent-hint": True,
-                        },
-                    },
-                    {
-                        "component": "VTextField",
-                        "props": {
-                            "model": "telegram_session",
-                            "label": "高级：已有登录凭证（StringSession，可留空）",
-                            "hint": "手机号登录成功后自动填写，无需手动生成。仅在迁移已有凭证时粘贴，请勿分享。",
                             "persistent-hint": True,
                             "type": "password",
                         },
@@ -1033,11 +1217,9 @@ class Tg115Channel(_PluginBase):
             "enabled": False,
             "telegram_api_id": "",
             "telegram_api_hash": "",
-            "telegram_session": "",
             "telegram_phone": "",
             "telegram_code": "",
             "telegram_password": "",
-            "telegram_login_action": "none",
             "resource_bot": "",
             "search_template": "{keyword}",
             "request_timeout": 60,
@@ -1063,8 +1245,9 @@ class Tg115Channel(_PluginBase):
             if self._config.get("transfer_backend") == "p115"
             else bool(self._config.get("telegram_transfer_template"))
         )
+        login_label = "已登录" if self._login_view()["logged_in"] else "未确认登录"
         status = (
-            f"启用：{'是' if self._enabled else '否'}；Telegram 配置：{'完整' if telegram_ready else '不完整'}；"
+            f"启用：{'是' if self._enabled else '否'}；Telegram：{login_label}；"
             f"转存配置：{'完整' if transfer_ready else '不完整'}；缓存资源：{len(self._resource_records)} 条"
         )
         content: list[dict[str, Any]] = [

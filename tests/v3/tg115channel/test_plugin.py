@@ -20,7 +20,7 @@ def test_form_uses_consistent_grid_and_preserves_models(plugin_module):
             if options.get("type") == "password":
                 assert options["autocomplete"] == "new-password"
     assert len(models) == len(set(models))
-    assert set(models) == set(defaults)
+    assert set(models) == {key for key in defaults if not key.startswith("_tg_")}
 
 
 class FakeTelegram:

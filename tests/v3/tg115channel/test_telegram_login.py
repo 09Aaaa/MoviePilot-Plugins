@@ -119,37 +119,36 @@ def test_duplicate_send_does_not_request_code(login):
     assert len(client.calls) == 1
 
 
-def test_plugin_clears_secrets_and_saves_session(plugin_module, monkeypatch):
+def test_button_login_keeps_session_on_server_and_survives_form_save(plugin_module, monkeypatch):
     plugin = plugin_module.Tg115Channel()
+    plugin.init_plugin({"telegram_api_id": "123", "telegram_api_hash": "hash"})
 
     async def step(**kwargs):
-        assert plugin._saved_config["telegram_code"] == ""
-        assert plugin._saved_config["telegram_password"] == ""
-        assert plugin._saved_config["telegram_login_action"] == "none"
+        assert "telegram_code" not in plugin._saved_config
+        assert "telegram_password" not in plugin._saved_config
+        assert "telegram_login_action" not in plugin._saved_config
         assert kwargs["password"] == "password"
         return {"message": "成功", "pending": {}, "session": "new-session"}
 
     monkeypatch.setattr(plugin_module, "login_step", step)
-    plugin.init_plugin(
-        {
-            "telegram_api_id": "123",
-            "telegram_login_action": "verify",
-            "telegram_code": "12345",
-            "telegram_password": "password",
-        }
-    )
-    assert plugin._saved_config["telegram_session"] == "new-session"
-    assert plugin.get_data("telegram_login_status") == "成功"
+    result = plugin.telegram_login_api({"action": "verify", "telegram_code": "12345", "telegram_password": "password"})
+    assert result["logged_in"] is True
+    assert "new-session" not in str(result)
+    assert "telegram_session" not in plugin._saved_config
+    assert plugin.get_data("telegram_auth")["session"] == "new-session"
     plugin.init_plugin(plugin._saved_config)
     assert plugin._config["telegram_session"] == "new-session"
+    assert plugin._login_view()["logged_in"] is True
 
 
 def test_cancel_preserves_existing_login(plugin_module):
     plugin = plugin_module.Tg115Channel()
+    plugin.init_plugin({"telegram_session": "existing"})
     plugin.save_data("telegram_login_pending", {"session": "pending"})
-    plugin.init_plugin({"telegram_login_action": "cancel", "telegram_session": "existing"})
-    assert plugin._saved_config["telegram_session"] == "existing"
+    plugin.telegram_login_api({"action": "cancel"})
+    assert plugin.get_data("telegram_auth")["session"] == "existing"
     assert plugin.get_data("telegram_login_pending") == {}
+    assert "telegram_session" not in plugin._saved_config
 
 
 def test_failed_login_preserves_session_and_action_does_not_replay(plugin_module, monkeypatch):
@@ -161,15 +160,9 @@ def test_failed_login_preserves_session_and_action_does_not_replay(plugin_module
         return {"message": "验证码错误", "pending": {"session": "pending"}}
 
     monkeypatch.setattr(plugin_module, "login_step", step)
-    plugin.init_plugin(
-        {
-            "telegram_api_id": "123",
-            "telegram_session": "existing",
-            "telegram_login_action": "verify",
-            "telegram_code": "12345",
-        }
-    )
-    assert plugin._saved_config["telegram_session"] == "existing"
+    plugin.init_plugin({"telegram_api_id": "123", "telegram_session": "existing"})
+    plugin.telegram_login_api({"action": "verify", "telegram_code": "12345"})
+    assert plugin.get_data("telegram_auth")["session"] == "existing"
     plugin.init_plugin(plugin._saved_config)
     assert len(calls) == 1
     assert plugin._config["telegram_session"] == "existing"
@@ -181,3 +174,59 @@ def test_blank_code_never_triggers_implicit_send(login):
     result = asyncio.run(module.login_step(**{**kwargs, "action": "verify", "pending": pending}))
     assert "请填写" in result["message"]
     assert len(client.calls) == 1
+
+
+def test_actual_status_unlocks_bot_and_revocation_locks_it(plugin_module, monkeypatch):
+    plugin = plugin_module.Tg115Channel()
+    plugin.init_plugin({"telegram_api_id": "123", "telegram_api_hash": "hash", "telegram_session": "stored"})
+    assert not plugin._login_view()["logged_in"]
+    state = ["logged_in"]
+
+    async def check(**kwargs):
+        assert kwargs["session"] == "stored"
+        return {"state": state[0], "message": state[0]}
+
+    monkeypatch.setattr(plugin_module, "check_session", check)
+    assert plugin.telegram_login_api({"action": "status"})["logged_in"]
+    state[0] = "logged_out"
+    assert not plugin.telegram_login_api({"action": "status"})["logged_in"]
+    assert plugin.get_data("telegram_auth")["session"] == "stored"
+
+
+def test_unsaved_app_credentials_cannot_unlock_bot(plugin_module, monkeypatch):
+    plugin = plugin_module.Tg115Channel()
+    plugin.init_plugin({"telegram_api_id": "123", "telegram_api_hash": "hash"})
+    result = plugin.telegram_login_api({"action": "status", "telegram_api_id": "456", "telegram_api_hash": "new"})
+    assert result["logged_in"] is False
+    assert plugin._config["telegram_api_id"] == "123"
+
+
+def test_view_flags_and_legacy_action_are_not_trusted_or_persisted(plugin_module, monkeypatch):
+    plugin = plugin_module.Tg115Channel()
+
+    async def forbidden(**_kwargs):
+        raise AssertionError("Saving settings must never send a code")
+
+    monkeypatch.setattr(plugin_module, "login_step", forbidden)
+    plugin.init_plugin(
+        {
+            "_tg_logged_in": True,
+            "telegram_login_action": "send",
+            "telegram_code": "12345",
+            "telegram_password": "secret",
+        }
+    )
+    assert not plugin._login_view()["logged_in"]
+    assert not any(key.startswith("_tg_") for key in plugin._saved_config)
+    assert "telegram_code" not in plugin._saved_config
+    assert "telegram_password" not in plugin._saved_config
+
+
+def test_check_session_calls_authorization_and_disconnects(login):
+    module, client, _kwargs = login
+    result = asyncio.run(module.check_session(api_id=123, api_hash="hash", session="session"))
+    assert result["state"] == "logged_in"
+    assert client.disconnected
+    client.authorized = False
+    result = asyncio.run(module.check_session(api_id=123, api_hash="hash", session="session"))
+    assert result["state"] == "logged_out"

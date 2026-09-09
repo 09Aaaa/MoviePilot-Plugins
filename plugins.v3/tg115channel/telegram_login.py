@@ -105,3 +105,30 @@ async def login_step(
     finally:
         with suppress(Exception):
             await asyncio.wait_for(client.disconnect(), timeout=5)
+
+
+async def check_session(*, api_id: int, api_hash: str, session: str) -> dict[str, str]:
+    """Check authorization without resolving a bot or sending it any messages."""
+    if not session:
+        return {"state": "logged_out", "message": "Telegram 未登录，请填写应用信息和手机号后发送验证码。"}
+    from telethon import TelegramClient, errors
+    from telethon.sessions import StringSession
+
+    client = None
+    try:
+        client = TelegramClient(
+            StringSession(session), api_id, api_hash, connection_retries=1, request_retries=0, flood_sleep_threshold=0
+        )
+        async with asyncio.timeout(20):
+            await client.connect()
+            if await client.is_user_authorized():
+                return {"state": "logged_in", "message": "Telegram 已登录，可以配置资源 Bot。"}
+            return {"state": "logged_out", "message": "Telegram 登录已失效，请重新登录。"}
+    except (errors.UnauthorizedError, ValueError):
+        return {"state": "logged_out", "message": "Telegram 登录凭证无效，请重新登录。"}
+    except Exception:
+        return {"state": "unknown", "message": "暂时无法确认 Telegram 登录状态，请检查网络后重试。"}
+    finally:
+        if client:
+            with suppress(Exception):
+                await asyncio.wait_for(client.disconnect(), timeout=5)
