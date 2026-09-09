@@ -12,6 +12,7 @@ from typing import Any
 
 from .models import BotReply, BotResource, ReplyButton, RequestResult
 from .protocol import extract_resources, render_template
+from .rate_limit import BotRateLimiter, BotRateLimitError
 
 
 class TelegramGatewayError(RuntimeError):
@@ -27,9 +28,9 @@ class TelegramGatewayConfig:
     search_template: str = "{keyword}"
     request_timeout: float = 60.0
     quiet_seconds: float = 2.0
-    max_messages: int = 12
+    bot_request_count: int = 5
+    bot_request_window: float = 60.0
     detail_button_pattern: str = ""
-    max_detail_clicks: int = 3
     connect_timeout: float = 20.0
 
     def validate(self) -> None:
@@ -45,10 +46,8 @@ class TelegramGatewayConfig:
             raise ValueError("Telegram 回复超时不能小于 5 秒")
         if not 0.3 <= self.quiet_seconds <= 15:
             raise ValueError("Telegram 收集静默时间必须在 0.3 到 15 秒之间")
-        if not 1 <= self.max_messages <= 50:
-            raise ValueError("Telegram 单次收集消息数必须在 1 到 50 之间")
-        if not 0 <= self.max_detail_clicks <= 10:
-            raise ValueError("Telegram 详情按钮点击数必须在 0 到 10 之间")
+        if self.bot_request_count < 1 or self.bot_request_window <= 0:
+            raise ValueError("Bot 请求次数和统计时段必须大于 0")
         render_template(self.search_template, {"keyword": "test"}, required=("keyword",))
         if self.detail_button_pattern:
             re.compile(self.detail_button_pattern, re.IGNORECASE)
@@ -68,6 +67,7 @@ class TelegramGateway:
         self._startup_error: BaseException | None = None
         self._lifecycle_lock = threading.RLock()
         self._request_lock = threading.Lock()
+        self.rate_limiter = BotRateLimiter(config.bot_request_count, config.bot_request_window)
 
     @property
     def running(self) -> bool:
@@ -207,15 +207,19 @@ class TelegramGateway:
             self._bot,
             timeout=self.config.request_timeout,
             exclusive=True,
+            max_messages=float("inf"),
         ) as conversation:
+            self.rate_limiter.acquire()
             sent = await conversation.send_message(text)
             first = await self._receive(conversation, self.config.request_timeout)
             if first is None:
                 raise TelegramGatewayError("资源机器人在超时前没有回复")
             native_messages.append(first)
 
-            while len(native_messages) < self.config.max_messages:
-                reply = await self._receive(conversation, self.config.quiet_seconds)
+            deadline = asyncio.get_running_loop().time() + self.config.request_timeout
+            while asyncio.get_running_loop().time() < deadline:
+                remaining = deadline - asyncio.get_running_loop().time()
+                reply = await self._receive(conversation, min(self.config.quiet_seconds, remaining))
                 if reply is None:
                     break
                 native_messages.append(reply)
@@ -225,40 +229,49 @@ class TelegramGateway:
                 if self.config.detail_button_pattern
                 else None
             )
-            clicked = 0
+            details_done = False
             if pattern:
                 for message in tuple(native_messages):
                     for row_index, row in enumerate(getattr(message, "buttons", None) or []):
                         for column_index, button in enumerate(row or []):
-                            if clicked >= self.config.max_detail_clicks:
+                            if details_done or asyncio.get_running_loop().time() >= deadline:
                                 break
                             if getattr(button, "url", None) or not getattr(button, "data", None):
                                 continue
                             if not pattern.search(str(getattr(button, "text", "") or "")):
                                 continue
                             try:
+                                self.rate_limiter.acquire()
                                 answer = await asyncio.wait_for(
                                     message.click(row_index, column_index),
-                                    timeout=min(15.0, self.config.request_timeout),
+                                    timeout=min(15.0, max(0.01, deadline - asyncio.get_running_loop().time())),
                                 )
                                 projection = self._callback_projection(answer)
                                 if projection:
                                     projections.append(projection)
-                                clicked += 1
-                                reply = await self._receive(conversation, self.config.quiet_seconds)
+                                reply = await self._receive(
+                                    conversation,
+                                    min(
+                                        self.config.quiet_seconds,
+                                        max(0.01, deadline - asyncio.get_running_loop().time()),
+                                    ),
+                                )
                                 if reply is not None:
                                     native_messages.append(reply)
+                            except BotRateLimitError:
+                                details_done = True
+                                break
                             except Exception:
                                 continue
-                        if clicked >= self.config.max_detail_clicks:
+                        if details_done or asyncio.get_running_loop().time() >= deadline:
                             break
-                    if clicked >= self.config.max_detail_clicks:
+                    if details_done or asyncio.get_running_loop().time() >= deadline:
                         break
 
             try:
                 recent = await self._client.get_messages(
                     self._bot,
-                    limit=self.config.max_messages,
+                    limit=None,
                     min_id=int(getattr(sent, "id", 0) or 0),
                 )
                 native_messages.extend(reversed(list(recent or [])))
@@ -289,11 +302,7 @@ class TelegramGateway:
             if not loop or not loop.is_running():
                 raise TelegramGatewayError("Telegram 事件循环不可用")
             future = asyncio.run_coroutine_threadsafe(self._request_async(text), loop)
-            budget = (
-                self.config.request_timeout
-                + self.config.quiet_seconds * (self.config.max_messages + self.config.max_detail_clicks + 1)
-                + 20
-            )
+            budget = 2 * self.config.request_timeout + 20
             try:
                 return future.result(timeout=budget)
             except FutureTimeoutError as exc:

@@ -63,12 +63,11 @@ def _config():
         "resource_bot": "resource_bot",
         "search_template": "{keyword}",
         "p115_cookie": "UID=1; CID=2; SEID=3",
-        "movie_path": "/影视/电影",
-        "tv_path": "/影视/电视剧",
+        "destination_path": "/影视/电影",
     }
 
 
-def test_native_search_returns_opaque_high_priority_resource(plugin_module):
+def test_native_search_returns_opaque_resource_without_priority(plugin_module):
     plugin = plugin_module.Tg115Channel()
     plugin.init_plugin(_config())
     resource = plugin_module.BotResource(
@@ -86,7 +85,7 @@ def test_native_search_returns_opaque_high_priority_resource(plugin_module):
     assert len(results) == 1
     assert results[0].site_name == "TG115"
     assert results[0].site_downloader == "Tg115Channel"
-    assert results[0].pri_order == 100
+    assert "pri_order" not in results[0].__dict__
     assert results[0].category == "电视剧"
     assert "115.com" not in results[0].enclosure
     assert gateway.calls == ["三体 S01"]
@@ -173,3 +172,46 @@ def test_moviepilot_module_contract_signatures(plugin_module):
     assert {"content", "download_dir", "cookie", "episodes", "category", "label", "downloader"} <= set(
         download_parameters
     )
+
+
+def test_all_resources_remain_downloadable_above_old_caps(plugin_module):
+    plugin = plugin_module.Tg115Channel()
+    plugin.init_plugin(_config())
+    resources = [
+        plugin_module.BotResource(
+            title=f"资源 {i}", url=f"https://115.com/s/share{i}?password=abcd", access_code="abcd"
+        )
+        for i in range(601)
+    ]
+    stored = plugin._store_search_results(cache_key="all", keyword="资源", media_type="movie", resources=resources)
+    assert len(stored) == 601
+    assert len(plugin._cached_resources("all")) == 601
+    assert all(identifier in plugin._resource_records for identifier, _ in stored)
+    assert plugin._destination("movie") == plugin._destination("tv") == plugin._destination("unknown")
+
+
+def test_directory_selection_and_failed_navigation(plugin_module, monkeypatch):
+    plugin = plugin_module.Tg115Channel()
+    calls = []
+
+    def listing(_self, directory_id, **_kwargs):
+        calls.append(directory_id)
+        if directory_id == "99":
+            raise RuntimeError("目录已删除")
+        return {
+            "id": directory_id,
+            "path": "/" if directory_id == "0" else "/电影",
+            "parent_id": "0",
+            "children": [{"title": "电影", "value": "12"}],
+        }
+
+    monkeypatch.setattr(plugin_module.P115TransferService, "list_directory", listing)
+    plugin.init_plugin({**_config(), "destination_id": "0", "refresh_directories": True})
+    assert plugin._config["destination_path"] == "/"
+    plugin.init_plugin({**plugin._saved_config, "destination_id": "12"})
+    assert plugin._config["destination_path"] == "/电影"
+    plugin.init_plugin({**plugin._saved_config, "destination_id": "99"})
+    assert plugin._config["destination_id"] == "12"
+    assert plugin._config["destination_path"] == "/电影"
+    assert calls == ["0", "12", "99"]
+    assert "目录已删除" in plugin.get_data("directory_status")

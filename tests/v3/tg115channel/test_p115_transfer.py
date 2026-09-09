@@ -85,3 +85,35 @@ def test_missing_share_code_is_rejected_before_network(pure_modules):
     assert result.ok is False
     assert "提取码" in result.message
     assert client.received == []
+
+
+def test_directory_browser_paginates_and_ignores_files(pure_modules):
+    class ListingClient:
+        def __init__(self):
+            self.offsets = []
+
+        def fs_files(self, payload, **_kwargs):
+            self.offsets.append(payload["offset"])
+            rows = (
+                [{"cid": "2", "n": "电影"}, {"fid": "10", "n": "文件"}]
+                if payload["offset"] == 0
+                else [{"cid": "3", "n": "电视剧"}]
+            )
+            return {"state": True, "path": [{"cid": "0", "name": "根目录"}], "count": 3, "data": rows}
+
+    client = ListingClient()
+    service = pure_modules.p115.P115TransferService("UID=1; CID=2; SEID=3", client_factory=lambda _: client)
+    result = service.list_directory("0")
+    assert client.offsets == [0, 2]
+    assert [item["value"] for item in result["children"]] == ["2", "3"]
+    assert result["path"] == "/"
+    with pytest.raises(RuntimeError, match="不匹配"):
+        service.list_directory("99")
+
+
+def test_selected_directory_id_avoids_ambiguous_path_lookup(pure_modules):
+    client = FakeClient(directory_id=12)
+    service = pure_modules.p115.P115TransferService("UID=1; CID=2; SEID=3", client_factory=lambda _: client)
+    result = service.transfer(url="https://115.com/s/example?password=abcd", destination="/电影", directory_id="88")
+    assert result.ok
+    assert client.received[0]["cid"] == 88

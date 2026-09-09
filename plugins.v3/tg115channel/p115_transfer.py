@@ -186,7 +186,68 @@ class P115TransferService:
         message = self._response_message(response) or "返回中没有目录 ID"
         raise RuntimeError(f"无法创建 115 目录: {message}")
 
-    def transfer(self, *, url: str, access_code: str = "", destination: str) -> TransferResult:
+    def list_directory(self, directory_id: str = "0", *, path: str = "/") -> dict[str, Any]:
+        """Read an existing directory and all child folders, without creating anything."""
+        with self._lock:
+            client = self._get_client()
+            if directory_id == "":
+                normalized = self.normalize_pan_path(path)
+                if normalized == "/":
+                    directory_id = "0"
+                else:
+                    response = client.fs_dir_getid(normalized, timeout=20)
+                    directory_id = str(response.get("id", ""))
+                    if not directory_id.isdigit() or int(directory_id) <= 0:
+                        raise RuntimeError("原转存目录不存在，请选择根目录后重新浏览")
+            if not str(directory_id).isdigit():
+                raise ValueError("115 目录 ID 无效")
+            directory_id = str(int(directory_id))
+            offset = 0
+            children = []
+            directory_path = "/"
+            parent_id = "0"
+            while True:
+                response = client.fs_files(
+                    {
+                        "cid": directory_id,
+                        "offset": offset,
+                        "limit": 1000,
+                        "cur": 1,
+                        "nf": 1,
+                        "show_dir": 1,
+                        "count_folders": 1,
+                        "o": "file_name",
+                        "asc": 1,
+                    },
+                    timeout=20,
+                )
+                if not self._response_ok(response):
+                    raise RuntimeError("无法读取 115 目录，请检查 Cookie 和目录权限")
+                ancestry = response.get("path") or []
+                if not ancestry or str(ancestry[-1].get("cid")) != directory_id:
+                    raise RuntimeError("115 返回的目录不匹配，目录可能已删除，请重新选择")
+                directory_path = "/" + "/".join(str(item["name"]) for item in ancestry if str(item["cid"]) != "0")
+                parent_id = str(ancestry[-2]["cid"]) if len(ancestry) > 1 else "0"
+                rows = response.get("data")
+                if not isinstance(rows, list):
+                    raise RuntimeError("115 目录列表格式异常")
+                for row in rows:
+                    if "fid" in row:
+                        continue
+                    cid = str(row.get("cid", ""))
+                    name = str(row.get("n", ""))
+                    if cid.isdigit() and name:
+                        children.append({"title": f"{name}（ID {cid}）", "value": cid})
+                offset += len(rows)
+                if offset >= int(response.get("count", offset)):
+                    break
+                if not rows:
+                    raise RuntimeError("115 目录分页不完整，请重新读取")
+            return {"id": directory_id, "path": directory_path, "parent_id": parent_id, "children": children}
+
+    def transfer(
+        self, *, url: str, access_code: str = "", destination: str, directory_id: str | None = None
+    ) -> TransferResult:
         destination = self.normalize_pan_path(destination)
         url = str(url or "").strip()
         if not self.is_share_url(url):
@@ -200,7 +261,9 @@ class P115TransferService:
         with self._lock:
             try:
                 client = self._get_client()
-                directory_id = self._directory_id(client, destination)
+                directory_id = (
+                    int(directory_id) if directory_id is not None else self._directory_id(client, destination)
+                )
                 response = client.share_receive(
                     {
                         "share_code": share_code,

@@ -30,7 +30,6 @@ from .telegram_login import login_step
 
 RESOURCE_DATA_KEY = "resource_registry_v1"
 HISTORY_DATA_KEY = "history_v1"
-MAX_RESOURCE_RECORDS = 500
 MAX_HISTORY_RECORDS = 100
 SENSITIVE_URL_PATTERN = re.compile(
     r"https?://(?:[a-z0-9-]+\.)*(?:115\.com|115cdn\.com)(?:[^\s\"'<>]*)?",
@@ -64,12 +63,12 @@ def _as_float(value: Any, default: float, minimum: float, maximum: float) -> flo
 
 
 class Tg115Channel(_PluginBase):
-    """Search a Telegram resource bot first and transfer selected shares to 115."""
+    """Search a Telegram resource bot and transfer selected shares to 115."""
 
     plugin_name = "TG 115资源通道"
-    plugin_desc = "优先通过 Telegram 资源机器人搜索，并将选中的 115 资源转存到分类目录。"
+    plugin_desc = "通过 Telegram 资源机器人搜索，并将选中的 115 资源转存到指定目录。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
-    plugin_version = "0.1.2"
+    plugin_version = "0.1.3"
     _login_lock = threading.Lock()
     plugin_author = "09a"
     author_url = ""
@@ -96,13 +95,11 @@ class Tg115Channel(_PluginBase):
             "search_template": str(config.get("search_template") or "{keyword}").strip(),
             "request_timeout": _as_float(config.get("request_timeout"), 60.0, 5.0, 180.0),
             "quiet_seconds": _as_float(config.get("quiet_seconds"), 2.0, 0.3, 15.0),
-            "max_messages": _as_int(config.get("max_messages"), 12, 1, 50),
+            "bot_request_count": _as_int(config.get("bot_request_count"), 5, 1, 1000),
+            "bot_request_window": _as_int(config.get("bot_request_window"), 60, 1, 86400),
             "detail_button_pattern": str(config.get("detail_button_pattern") or "").strip(),
-            "max_detail_clicks": _as_int(config.get("max_detail_clicks"), 3, 0, 10),
-            "result_limit": _as_int(config.get("result_limit"), 10, 1, 30),
             "search_cache_minutes": _as_int(config.get("search_cache_minutes"), 15, 0, 1440),
             "resource_ttl_hours": _as_int(config.get("resource_ttl_hours"), 168, 1, 2160),
-            "resource_priority": _as_int(config.get("resource_priority"), 100, 1, 100),
             "transfer_backend": str(config.get("transfer_backend") or "p115").strip().lower(),
             "p115_cookie": str(config.get("p115_cookie") or "").strip(),
             "telegram_transfer_template": str(config.get("telegram_transfer_template") or "").strip(),
@@ -112,9 +109,9 @@ class Tg115Channel(_PluginBase):
             "telegram_failure_pattern": str(
                 config.get("telegram_failure_pattern") or r"(?:失败|错误|失效|不存在|无权限)"
             ).strip(),
-            "movie_path": self._safe_path(config.get("movie_path"), "/影视/电影"),
-            "tv_path": self._safe_path(config.get("tv_path"), "/影视/电视剧"),
-            "default_path": self._safe_path(config.get("default_path"), "/影视/待整理"),
+            "destination_path": self._safe_path(config.get("destination_path") or config.get("default_path"), "/"),
+            "destination_id": str(config.get("destination_id", "")),
+            "refresh_directories": False,
         }
         if self._config["transfer_backend"] not in {"p115", "telegram"}:
             self._config["transfer_backend"] = "p115"
@@ -128,9 +125,42 @@ class Tg115Channel(_PluginBase):
         self._telegram: TelegramGateway | None = None
         self._p115 = P115TransferService(self._config["p115_cookie"])
 
+        self._process_directory(config)
         self._process_login(config)
         if self._enabled:
             self._configure_telegram()
+
+    def _process_directory(self, submitted: dict[str, Any]) -> None:
+        cached = self.get_data("directory_browser") or {}
+        cookie_key = hashlib.sha256(self._config["p115_cookie"].encode()).hexdigest()
+        selected = self._config["destination_id"]
+        changed = selected != cached.get("id", "")
+        if cached and cached.get("cookie_key") != cookie_key:
+            self._config["destination_id"] = ""
+            selected = ""
+            changed = True
+        refresh = _as_bool(submitted.get("refresh_directories"))
+        if not refresh and not changed:
+            return
+        self.update_config(self._config)
+        self.save_data("directory_status_cookie", cookie_key)
+        try:
+            listing = self._p115.list_directory(selected, path=self._config["destination_path"])
+        except Exception as exc:
+            if cached.get("cookie_key") == cookie_key:
+                self._config["destination_id"] = cached["id"]
+                self._config["destination_path"] = cached["path"]
+            else:
+                self._config["destination_id"] = ""
+            self.save_data("directory_status", self._safe_message(exc))
+        else:
+            self._config["destination_id"] = listing["id"]
+            self._config["destination_path"] = listing["path"]
+            self.save_data("directory_browser", {**listing, "cookie_key": cookie_key})
+            self.save_data(
+                "directory_status", f"当前转存目录：{listing['path']}；已读取 {len(listing['children'])} 个子目录。"
+            )
+        self.update_config(self._config)
 
     def _process_login(self, submitted: dict[str, Any]) -> None:
         action = submitted.get("telegram_login_action", "none")
@@ -199,11 +229,18 @@ class Tg115Channel(_PluginBase):
                 search_template=self._config["search_template"],
                 request_timeout=self._config["request_timeout"],
                 quiet_seconds=self._config["quiet_seconds"],
-                max_messages=self._config["max_messages"],
+                bot_request_count=self._config["bot_request_count"],
+                bot_request_window=self._config["bot_request_window"],
                 detail_button_pattern=self._config["detail_button_pattern"],
-                max_detail_clicks=self._config["max_detail_clicks"],
             )
             self._telegram = TelegramGateway(gateway_config)
+            budget_key = (self._config["telegram_api_id"], self._config["resource_bot"])
+            if getattr(self, "_bot_budget_key", None) == budget_key:
+                self._telegram.rate_limiter = self._bot_budget
+                self._bot_budget.count = gateway_config.bot_request_count
+                self._bot_budget.seconds = gateway_config.bot_request_window
+            self._bot_budget_key = budget_key
+            self._bot_budget = self._telegram.rate_limiter
             self._validate_transfer_patterns()
         except (TypeError, ValueError, re.error) as exc:
             self._telegram = None
@@ -299,8 +336,6 @@ class Tg115Channel(_PluginBase):
         self._resource_records = {
             identifier: record for identifier, record in ordered if now - float(record.get("discovered_at") or 0) <= ttl
         }
-        if len(self._resource_records) > MAX_RESOURCE_RECORDS:
-            self._resource_records = dict(list(self._resource_records.items())[:MAX_RESOURCE_RECORDS])
 
     @staticmethod
     def _media_type_key(media_type: Any) -> str:
@@ -320,11 +355,7 @@ class Tg115Channel(_PluginBase):
         return ""
 
     def _destination(self, media_type: str) -> str:
-        if media_type == "tv":
-            return self._config["tv_path"]
-        if media_type == "movie":
-            return self._config["movie_path"]
-        return self._config["default_path"]
+        return self._config["destination_path"]
 
     def _cache_key(self, keyword: str, media_type: str) -> str:
         return f"{media_type}:{normalize_keyword(keyword).casefold()}"
@@ -356,7 +387,7 @@ class Tg115Channel(_PluginBase):
         now = time.time()
         stored: list[tuple[str, dict[str, Any]]] = []
         with self._state_lock:
-            for resource in resources[: self._config["result_limit"]]:
+            for resource in resources:
                 identifier = resource_id(resource, context=f"{media_type}:{keyword}")
                 record = resource.to_record(media_type=media_type, keyword=keyword, discovered_at=now)
                 self._resource_records[identifier] = record
@@ -385,7 +416,6 @@ class Tg115Channel(_PluginBase):
             labels.append(resource.quality)
         return TorrentInfo(
             site_name="TG115",
-            site_order=0,
             site_downloader=self.__class__.__name__,
             title=f"{keyword}{quality_suffix}".strip(),
             description=" · ".join(details),
@@ -398,7 +428,6 @@ class Tg115Channel(_PluginBase):
             uploadvolumefactor=1.0,
             downloadvolumefactor=0.0,
             labels=labels,
-            pri_order=self._config["resource_priority"],
             category=self._category(media_type),
         )
 
@@ -510,6 +539,7 @@ class Tg115Channel(_PluginBase):
                     url=resource.url,
                     access_code=resource.access_code,
                     destination=destination,
+                    directory_id=self._config["destination_id"] or None,
                 )
 
         fingerprint = identifier[:10]
@@ -597,6 +627,35 @@ class Tg115Channel(_PluginBase):
                 if control["component"] == "VTextField":
                     options["autocomplete"] = "new-password" if options.get("type") == "password" else "off"
                     options["spellcheck"] = False
+                if options.get("model") == "destination_id":
+                    cached = self.get_data("directory_browser") or {}
+                    current = getattr(self, "_config", {})
+                    cookie_key = hashlib.sha256(current.get("p115_cookie", "").encode()).hexdigest()
+                    items = [{"title": "根目录 /", "value": "0"}]
+                    if cached.get("cookie_key") == cookie_key:
+                        items += [
+                            {"title": f"当前目录：{cached['path']}", "value": cached["id"]},
+                            {"title": "返回上一级", "value": cached["parent_id"]},
+                            *cached["children"],
+                        ]
+                    else:
+                        items.append(
+                            {
+                                "title": current.get("destination_path", "待读取当前目录"),
+                                "value": current.get("destination_id", ""),
+                            }
+                        )
+                    unique = {item["value"]: item for item in items}
+                    if cached.get("cookie_key") == cookie_key:
+                        unique[cached["id"]] = {"title": f"当前目录：{cached['path']}", "value": cached["id"]}
+                    options["items"] = list(unique.values())
+                    status = (
+                        self.get_data("directory_status")
+                        if self.get_data("directory_status_cookie") == cookie_key
+                        else None
+                    )
+                    if status:
+                        options["hint"] = status + " 选择后保存，再打开可继续选择下一级。"
                 if options.get("model") == "telegram_api_id":
                     options.update({"inputmode": "numeric", "placeholder": "例如 12345678"})
         form[0]["content"] = [{"component": "VRow", "props": {"style": "margin: 0;"}, "content": fields}]
@@ -652,25 +711,31 @@ class Tg115Channel(_PluginBase):
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VTextField",
                                         "props": {
-                                            "model": "resource_priority",
-                                            "label": "资源优先级",
+                                            "model": "bot_request_count",
+                                            "label": "每个时段最多请求 Bot 次数",
                                             "type": "number",
+                                            "hint": "搜索、详情按钮和 TG 转存共用额度；达到上限后停止新请求。",
                                         },
                                     }
                                 ],
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
                                         "component": "VTextField",
-                                        "props": {"model": "result_limit", "label": "最多返回资源数", "type": "number"},
+                                        "props": {
+                                            "model": "bot_request_window",
+                                            "label": "Bot 请求统计时段（秒）",
+                                            "type": "number",
+                                            "hint": "例如填写 60，次数填写 5，表示任意连续 60 秒最多请求 5 次。",
+                                        },
                                     }
                                 ],
                             },
@@ -769,8 +834,7 @@ class Tg115Channel(_PluginBase):
                                 {"title": "取消本次登录 / 准备重发", "value": "cancel"},
                             ],
                             "hint": (
-                                "保存后重新打开配置查看结果。新设备验证按 Telegram 提示完成；"
-                                "登录成功后自动保存凭证。"
+                                "保存后重新打开配置查看结果。新设备验证按 Telegram 提示完成；登录成功后自动保存凭证。"
                             ),
                             "persistent-hint": True,
                         },
@@ -849,37 +913,13 @@ class Tg115Channel(_PluginBase):
                                     }
                                 ],
                             },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {"model": "max_messages", "label": "最多收集消息数", "type": "number"},
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "max_detail_clicks",
-                                            "label": "最多点击详情按钮",
-                                            "type": "number",
-                                        },
-                                    }
-                                ],
-                            },
                         ],
                     },
                     {
                         "component": "VTextField",
                         "props": {
                             "model": "p115_cookie",
-                            "label": "115 客户端 Cookie（115 直转时填写）",
+                            "label": "115 Cookie（直转或读取目录时填写）",
                             "type": "password",
                             "hint": "需要包含 UID、CID、SEID",
                         },
@@ -922,31 +962,33 @@ class Tg115Channel(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
-                                        "component": "VTextField",
-                                        "props": {"model": "movie_path", "label": "115 电影目录"},
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "destination_id",
+                                            "label": "115 转存目录",
+                                            "items": [],
+                                            "hint": (
+                                                "先填写 Cookie 并读取目录；选择文件夹后保存，"
+                                                "可继续选择下一级。所有资源保存到所选目录。"
+                                            ),
+                                        },
                                     }
                                 ],
                             },
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
+                                "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
-                                        "component": "VTextField",
-                                        "props": {"model": "tv_path", "label": "115 电视剧目录"},
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {"model": "default_path", "label": "115 兜底目录"},
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "refresh_directories",
+                                            "label": "读取 / 刷新 115 目录（保存后执行）",
+                                            "hint": "首次读取或目录变更后使用；保存后重新打开配置查看实际目录。",
+                                        },
                                     }
                                 ],
                             },
@@ -1000,21 +1042,18 @@ class Tg115Channel(_PluginBase):
             "search_template": "{keyword}",
             "request_timeout": 60,
             "quiet_seconds": 2,
-            "max_messages": 12,
+            "bot_request_count": 5,
+            "bot_request_window": 60,
             "detail_button_pattern": "",
-            "max_detail_clicks": 3,
-            "result_limit": 10,
             "search_cache_minutes": 15,
             "resource_ttl_hours": 168,
-            "resource_priority": 100,
             "transfer_backend": "p115",
             "p115_cookie": "",
             "telegram_transfer_template": "",
             "telegram_success_pattern": r"(?:成功|已转存|已保存|任务已提交)",
             "telegram_failure_pattern": r"(?:失败|错误|失效|不存在|无权限)",
-            "movie_path": "/影视/电影",
-            "tv_path": "/影视/电视剧",
-            "default_path": "/影视/待整理",
+            "destination_id": "",
+            "refresh_directories": False,
         }
 
     def get_page(self) -> list[dict[str, Any]]:
