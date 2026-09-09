@@ -55,7 +55,6 @@ def login_buttons(plugin_id: str) -> list[dict]:
         ("cancel", "取消本次登录"),
     ):
         props = {
-            "text": label,
             "type": "button",
             "color": "primary",
             "variant": "tonal",
@@ -69,7 +68,36 @@ def login_buttons(plugin_id: str) -> list[dict]:
             {
                 "component": "VCol",
                 "props": column_props,
-                "content": [{"component": "VBtn", "props": props}],
+                "content": [{"component": "VBtn", "text": label, "props": props}],
             }
         )
     return controls
+
+
+def directory_handler(plugin_id: str, *, selection: bool = False) -> str:
+    route = json.dumps(f"plugin/{plugin_id}/115/directories")
+    target = "String(event)" if selection else "String(model.destination_id || '0')"
+    return f"""async (event) => {{
+        if (model._dir_busy) return;
+        model._dir_busy = true;
+        const previous = model._dir_current;
+        try {{
+            const result = await window.MoviePilotAPI.post({route}, {{
+                directory_id: {target}, cookie: model.p115_cookie
+            }}, {{timeout: 55000, feedback: 'silent'}});
+            if (!result.ok) {{ model._dir_message = result.message; model.destination_id = previous; return; }}
+            const listing = result.directory;
+            const items = [{{title: '当前目录：' + listing.path, value: listing.id}}];
+            if (listing.id !== '0') items.push({{title:'返回上一级', value:listing.parent_id}});
+            if (listing.id !== '0' && listing.parent_id !== '0') items.push({{title:'根目录 /', value:'0'}});
+            items.push(...listing.children);
+            model._dir_items = items;
+            model.destination_id = listing.id;
+            model._dir_current = listing.id;
+            model.destination_path = listing.path;
+            model._dir_message = '已选择：' + listing.path + '。可继续选择子目录，最后点击保存生效。';
+        }} catch (_) {{
+            model.destination_id = previous;
+            model._dir_message = '读取目录失败，请检查网络后重试。';
+        }} finally {{ model._dir_busy = false; }}
+    }}"""

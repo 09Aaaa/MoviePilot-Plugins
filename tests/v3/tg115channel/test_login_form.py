@@ -27,9 +27,7 @@ def test_form_groups_and_removes_manual_session(plugin_module):
     assert "_tg_logged_in" in controls["resource_bot"][0]["props"]["show"]
     assert "password_needed" in controls["telegram_password"][0]["props"]["show"]
     assert defaults["_tg_logged_in"] is False
-    assert any(
-        control.get("props", {}).get("text") == "发送登录验证码" for col in columns for control in col["content"]
-    )
+    assert any(control.get("text") == "发送登录验证码" for col in columns for control in col["content"])
 
 
 def test_button_event_runs_with_host_model_contract(plugin_module):
@@ -135,3 +133,69 @@ for (const state of ['logged_out', 'code_sent', 'password_needed', 'logged_in', 
         timeout=10,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_buttons_have_native_slot_content(plugin_module):
+    form, _ = plugin_module.Tg115Channel().get_form()
+    buttons = []
+
+    def visit(item):
+        if item["component"] == "VBtn":
+            # FormRender always supplies a default slot, so props.text is insufficient.
+            assert item.get("text")
+            buttons.append(item["text"])
+        for child in item.get("content", []):
+            visit(child)
+
+    for item in form:
+        visit(item)
+    assert "发送登录验证码" in buttons
+    assert "读取 / 刷新 115 目录" in buttons
+
+
+def test_directory_event_navigates_without_save_and_rolls_back_errors(plugin_module):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js required")
+    module = importlib.import_module(f"{plugin_module.__package__}.login_form")
+    script = r"""
+const assert = require('node:assert/strict');
+const model = {_dir_busy:false, _dir_current:'0', destination_id:'0', p115_cookie:'test'};
+const calls = [];
+global.window = {MoviePilotAPI: {post: async (url, payload) => {
+ calls.push(payload.directory_id);
+ assert.equal(url, 'plugin/Tg115Channel/115/directories');
+ if (payload.directory_id === 'missing') return {ok:false, message:'目录不存在'};
+ return {ok:true, directory:{id:payload.directory_id, path:'/影视/电影', parent_id:'123', children:[]}};
+}}};
+const run = new Function('model', 'event', 'with(model) { return (' + HANDLER + ')(event); }');
+(async () => {
+ const child = '3438672442749353668';
+ await run(model, child);
+ assert.equal(model.destination_id, child);
+ assert.equal(model._dir_items[1].value, '123');
+ await run(model, '123');
+ assert.equal(model.destination_id, '123');
+ await run(model, 'missing');
+ assert.equal(model.destination_id, '123');
+ assert.equal(model._dir_busy, false);
+ assert.deepEqual(calls, [child,'123','missing']);
+})().catch(e => {console.error(e); process.exit(1);});
+""".replace("HANDLER", json.dumps(module.directory_handler("Tg115Channel", selection=True)))
+    subprocess.run([node, "-e", script], check=True, capture_output=True, text=True, timeout=10)
+
+
+def test_directory_api_does_not_apply_target(plugin_module, monkeypatch):
+    plugin = plugin_module.Tg115Channel()
+    plugin.init_plugin({})
+    before = dict(plugin._saved_config)
+    monkeypatch.setattr(
+        plugin_module.P115TransferService,
+        "list_directory",
+        lambda self, cid: {"id": cid, "path": "/电影", "parent_id": "0", "children": []},
+    )
+    response = plugin.directory_api({"directory_id": "123", "cookie": "test-cookie"})
+    assert response["ok"]
+    assert response["directory"]["id"] == "123"
+    assert plugin._saved_config == before
+    assert "test-cookie" not in str(response)

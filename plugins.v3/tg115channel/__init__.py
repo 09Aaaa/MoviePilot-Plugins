@@ -15,7 +15,7 @@ from app.plugins import _PluginBase
 from app.sdk.logging import logger
 from app.sdk.media import TorrentInfo
 
-from .login_form import BOT_UNLOCKED, login_buttons, login_handler
+from .login_form import BOT_UNLOCKED, directory_handler, login_buttons, login_handler
 from .models import BotResource
 from .p115_transfer import P115TransferService, TransferResult
 from .protocol import (
@@ -69,7 +69,7 @@ class Tg115Channel(_PluginBase):
     plugin_name = "TG 115资源通道"
     plugin_desc = "通过 Telegram 资源机器人搜索，并将选中的 115 资源转存到指定目录。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
-    plugin_version = "0.1.5"
+    plugin_version = "0.1.6"
     _login_lock = threading.RLock()
     plugin_author = "09a"
     author_url = ""
@@ -691,6 +691,15 @@ class Tg115Channel(_PluginBase):
             "download": self.download,
         }
 
+    def directory_api(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # Browsing is read-only; the ordinary MP Save button applies the destination.
+        try:
+            service = P115TransferService(str(payload.get("cookie") or self._config.get("p115_cookie", "")))
+            listing = service.list_directory(str(payload.get("directory_id", "0")))
+            return {"ok": True, "directory": listing}
+        except Exception:
+            return {"ok": False, "message": "无法读取目录，请检查 115 Cookie、网络和目录是否存在。"}
+
     def get_api(self) -> list[dict[str, Any]]:
         from app.api.dependencies.auth import get_current_active_superuser_async
         from fastapi import Depends
@@ -703,7 +712,15 @@ class Tg115Channel(_PluginBase):
                 "summary": "Telegram 账号登录和状态检查",
                 "auth": "bear",
                 "dependencies": [Depends(get_current_active_superuser_async)],
-            }
+            },
+            {
+                "path": "/115/directories",
+                "endpoint": self.directory_api,
+                "methods": ["POST"],
+                "summary": "读取 115 子目录",
+                "auth": "bear",
+                "dependencies": [Depends(get_current_active_superuser_async)],
+            },
         ]
 
     def get_form(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -752,14 +769,22 @@ class Tg115Channel(_PluginBase):
                     unique = {item["value"]: item for item in items}
                     if cached.get("cookie_key") == cookie_key:
                         unique[cached["id"]] = {"title": f"当前目录：{cached['path']}", "value": cached["id"]}
-                    options["items"] = list(unique.values())
+                    defaults["_dir_items"] = list(unique.values())
+                    defaults["_dir_current"] = current.get("destination_id", "")
+                    defaults["_dir_busy"] = False
+                    defaults["_dir_message"] = "选择目录后直接加载子目录；最后点击保存生效。"
+                    options["items"] = "{{ model._dir_items }}"
+                    options["disabled"] = "{{ model._dir_busy }}"
+                    options["loading"] = "{{ model._dir_busy }}"
+                    options["onUpdate:modelValue"] = directory_handler(self.__class__.__name__, selection=True)
                     status = (
                         self.get_data("directory_status")
                         if self.get_data("directory_status_cookie") == cookie_key
                         else None
                     )
                     if status:
-                        options["hint"] = status + " 选择后保存，再打开可继续选择下一级。"
+                        defaults["_dir_message"] = status + " 选择后直接进入子目录。"
+                    options["hint"] = "{{ model._dir_message }}"
                 if options.get("model") == "telegram_api_id":
                     options.update({"inputmode": "numeric", "placeholder": "例如 12345678"})
         view = self._login_view()
@@ -816,6 +841,21 @@ class Tg115Channel(_PluginBase):
             elif model in bot_models:
                 column["props"]["show"] = "{{ " + BOT_UNLOCKED + " }}"
                 bot.append(column)
+            elif model == "refresh_directories":
+                column["content"] = [
+                    {
+                        "component": "VBtn",
+                        "text": "读取 / 刷新 115 目录",
+                        "props": {
+                            "type": "button",
+                            "variant": "tonal",
+                            "color": "primary",
+                            "disabled": "{{ model._dir_busy }}",
+                            "onClick": directory_handler(self.__class__.__name__),
+                        },
+                    }
+                ]
+                other.append(column)
             elif control.get("component") != "VAlert":
                 other.append(column)
 
@@ -1239,7 +1279,6 @@ class Tg115Channel(_PluginBase):
             "telegram_success_pattern": r"(?:成功|已转存|已保存|任务已提交)",
             "telegram_failure_pattern": r"(?:失败|错误|失效|不存在|无权限)",
             "destination_id": "",
-            "refresh_directories": False,
         }
 
     def get_page(self) -> list[dict[str, Any]]:

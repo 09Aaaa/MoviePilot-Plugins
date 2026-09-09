@@ -1,6 +1,6 @@
 [project]
 name = "moviepilot-plugin-tg115channel"
-version = "0.1.5"
+version = "0.1.6"
 requires-python = ">=3.12"
 dependencies = [
     "Telethon>=1.44,<2",
