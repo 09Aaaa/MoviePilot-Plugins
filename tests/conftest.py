@@ -47,6 +47,9 @@ def plugin_module():
         def __init__(self):
             self._test_data = {}
 
+        def update_config(self, config):
+            self._saved_config = dict(config)
+
         def get_data(self, key=None, plugin_id=None):
             del plugin_id
             return self._test_data.get(key)

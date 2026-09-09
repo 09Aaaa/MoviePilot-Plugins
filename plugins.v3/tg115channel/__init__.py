@@ -7,6 +7,7 @@ import hashlib
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from .protocol import (
     resource_id,
 )
 from .telegram_gateway import TelegramGateway, TelegramGatewayConfig
+from .telegram_login import login_step
 
 RESOURCE_DATA_KEY = "resource_registry_v1"
 HISTORY_DATA_KEY = "history_v1"
@@ -67,7 +69,8 @@ class Tg115Channel(_PluginBase):
     plugin_name = "TG 115资源通道"
     plugin_desc = "优先通过 Telegram 资源机器人搜索，并将选中的 115 资源转存到分类目录。"
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/download.png"
-    plugin_version = "0.1.1"
+    plugin_version = "0.1.2"
+    _login_lock = threading.Lock()
     plugin_author = "09a"
     author_url = ""
     plugin_config_prefix = "tg115channel_"
@@ -85,6 +88,10 @@ class Tg115Channel(_PluginBase):
             "telegram_api_id": str(config.get("telegram_api_id") or "").strip(),
             "telegram_api_hash": str(config.get("telegram_api_hash") or "").strip(),
             "telegram_session": str(config.get("telegram_session") or "").strip(),
+            "telegram_phone": str(config.get("telegram_phone") or "").strip(),
+            "telegram_login_action": "none",
+            "telegram_code": "",
+            "telegram_password": "",
             "resource_bot": str(config.get("resource_bot") or "").strip().lstrip("@"),
             "search_template": str(config.get("search_template") or "{keyword}").strip(),
             "request_timeout": _as_float(config.get("request_timeout"), 60.0, 5.0, 180.0),
@@ -121,8 +128,48 @@ class Tg115Channel(_PluginBase):
         self._telegram: TelegramGateway | None = None
         self._p115 = P115TransferService(self._config["p115_cookie"])
 
+        self._process_login(config)
         if self._enabled:
             self._configure_telegram()
+
+    def _process_login(self, submitted: dict[str, Any]) -> None:
+        action = submitted.get("telegram_login_action", "none")
+        if action not in {"send", "verify", "cancel"}:
+            if submitted.get("telegram_code") or submitted.get("telegram_password"):
+                self.update_config(self._config)
+            return
+        # Clear one-shot actions and secrets before doing any network work.
+        self.update_config(self._config)
+        with self._login_lock:
+            if action == "cancel":
+                self.save_data("telegram_login_pending", {})
+                self.save_data("telegram_login_status", "本次登录已取消，已有登录凭证保留。")
+                return
+            try:
+                api_id = int(self._config["telegram_api_id"])
+                kwargs = dict(
+                    action=action,
+                    api_id=api_id,
+                    api_hash=self._config["telegram_api_hash"],
+                    phone=self._config["telegram_phone"],
+                    code=str(submitted.get("telegram_code") or "").strip(),
+                    password=str(submitted.get("telegram_password") or ""),
+                    pending=self.get_data("telegram_login_pending") or {},
+                )
+                # init_plugin may run inside the host's event loop.
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    result = executor.submit(lambda: asyncio.run(login_step(**kwargs))).result()
+            except (ValueError, TypeError):
+                result = {"message": "请填写有效的数字应用 ID 后重试。", "pending": {}}
+            except ImportError:
+                result = {"message": "缺少 Telethon 依赖，请重新安装插件依赖。", "pending": {}}
+            except Exception:
+                result = {"message": "登录操作未完成，请检查配置和服务器网络后重试。", "pending": {}}
+            self.save_data("telegram_login_pending", result["pending"])
+            self.save_data("telegram_login_status", result["message"])
+            if result.get("session"):
+                self._config["telegram_session"] = result["session"]
+                self.update_config(self._config)
 
     @staticmethod
     def _safe_path(value: Any, fallback: str) -> str:
@@ -515,6 +562,18 @@ class Tg115Channel(_PluginBase):
 
     def get_form(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         form, defaults = self._get_form_schema()
+        status = self.get_data("telegram_login_status") or "尚未进行手机号登录；已有登录凭证可继续使用。"
+        form[0]["content"].insert(
+            0,
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "info",
+                    "variant": "tonal",
+                    "text": status,
+                },
+            },
+        )
         # Keep every control in the same grid; adjacent bare inputs otherwise
         # collide with Vuetify rows' negative margins and floating labels.
         fields = []
@@ -577,7 +636,12 @@ class Tg115Channel(_PluginBase):
                                         "component": "VSelect",
                                         "props": {
                                             "model": "transfer_backend",
-                                            "label": "转存后端",
+                                            "label": "转存方式",
+                                            "hint": (
+                                                "将分享资源保存到你的 115 网盘。"
+                                                "115 直转由插件完成；TG 命令转存需机器人支持。"
+                                            ),
+                                            "persistent-hint": True,
                                             "items": [
                                                 {"title": "115 直转", "value": "p115"},
                                                 {"title": "TG 命令转存", "value": "telegram"},
@@ -621,7 +685,14 @@ class Tg115Channel(_PluginBase):
                                 "content": [
                                     {
                                         "component": "VTextField",
-                                        "props": {"model": "telegram_api_id", "label": "Telegram api_id"},
+                                        "props": {
+                                            "model": "telegram_api_id",
+                                            "label": "Telegram 应用 ID（api_id）",
+                                            "hint": (
+                                                "在 my.telegram.org 的 API development tools 页面申请，填写数字 ID。"
+                                            ),
+                                            "persistent-hint": True,
+                                        },
                                     }
                                 ],
                             },
@@ -633,7 +704,9 @@ class Tg115Channel(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "telegram_api_hash",
-                                            "label": "Telegram api_hash",
+                                            "label": "Telegram 应用密钥（api_hash）",
+                                            "hint": "与应用 ID 在同一页面获取，复制对应的 api_hash。",
+                                            "persistent-hint": True,
                                             "type": "password",
                                         },
                                     }
@@ -657,7 +730,60 @@ class Tg115Channel(_PluginBase):
                     },
                     {
                         "component": "VTextField",
-                        "props": {"model": "telegram_session", "label": "Telethon StringSession", "type": "password"},
+                        "props": {
+                            "model": "telegram_phone",
+                            "label": "Telegram 手机号（含国家区号）",
+                            "hint": "例如 +8613800138000。填写应用 ID、密钥和手机号后，选择“发送验证码”并保存。",
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "telegram_code",
+                            "label": "登录验证码",
+                            "hint": "查看 Telegram 客户端或短信中的验证码，填写后选择“完成登录”并保存。",
+                            "persistent-hint": True,
+                            "type": "password",
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "telegram_password",
+                            "label": "两步验证密码（按提示填写）",
+                            "hint": "仅在账号开启两步验证时需要；每次保存后清空。",
+                            "persistent-hint": True,
+                            "type": "password",
+                        },
+                    },
+                    {
+                        "component": "VSelect",
+                        "props": {
+                            "model": "telegram_login_action",
+                            "label": "Telegram 登录操作（选择后保存）",
+                            "items": [
+                                {"title": "不执行登录操作", "value": "none"},
+                                {"title": "发送验证码", "value": "send"},
+                                {"title": "完成登录", "value": "verify"},
+                                {"title": "取消本次登录 / 准备重发", "value": "cancel"},
+                            ],
+                            "hint": (
+                                "保存后重新打开配置查看结果。新设备验证按 Telegram 提示完成；"
+                                "登录成功后自动保存凭证。"
+                            ),
+                            "persistent-hint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "telegram_session",
+                            "label": "高级：已有登录凭证（StringSession，可留空）",
+                            "hint": "手机号登录成功后自动填写，无需手动生成。仅在迁移已有凭证时粘贴，请勿分享。",
+                            "persistent-hint": True,
+                            "type": "password",
+                        },
                     },
                     {
                         "component": "VRow",
@@ -753,7 +879,7 @@ class Tg115Channel(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "p115_cookie",
-                            "label": "115 客户端 Cookie（直转后端）",
+                            "label": "115 客户端 Cookie（115 直转时填写）",
                             "type": "password",
                             "hint": "需要包含 UID、CID、SEID",
                         },
@@ -762,7 +888,7 @@ class Tg115Channel(_PluginBase):
                         "component": "VTextField",
                         "props": {
                             "model": "telegram_transfer_template",
-                            "label": "TG 转存消息模板（TG 命令后端）",
+                            "label": "TG 转存命令模板（TG 命令转存时填写）",
                             "hint": "可用 {url} {code} {path} {title}；必须包含 {url} 和 {path}",
                         },
                     },
@@ -866,6 +992,10 @@ class Tg115Channel(_PluginBase):
             "telegram_api_id": "",
             "telegram_api_hash": "",
             "telegram_session": "",
+            "telegram_phone": "",
+            "telegram_code": "",
+            "telegram_password": "",
+            "telegram_login_action": "none",
             "resource_bot": "",
             "search_template": "{keyword}",
             "request_timeout": 60,
@@ -908,6 +1038,18 @@ class Tg115Channel(_PluginBase):
                 },
             }
         ]
+        login_status = self.get_data("telegram_login_status")
+        if login_status:
+            content.append(
+                {
+                    "component": "VAlert",
+                    "props": {
+                        "type": "info",
+                        "variant": "tonal",
+                        "text": login_status,
+                    },
+                }
+            )
         if self._last_error:
             content.append(
                 {
